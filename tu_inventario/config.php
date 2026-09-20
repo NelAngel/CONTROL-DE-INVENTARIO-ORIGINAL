@@ -80,59 +80,17 @@ function logAudit($action, $table, $record_id, $old_data = null, $new_data = nul
 }
 
 // ============================================================
-// FUNCIONES DE STOCK TRADICIONAL
+// FUNCIONES DE STOCK
 // ============================================================
 
 function getStock($producto_id) {
-    try {
-        $pdo = getConnection();
-        $stmt = $pdo->prepare("
-            SELECT COALESCE(
-                (SELECT SUM(CASE WHEN m.tipo_movimiento IN ('ENTRADA', 'AJUSTE') THEN m.cantidad ELSE 0 END) -
-                 SUM(CASE WHEN m.tipo_movimiento IN ('SALIDA', 'TRANSFERENCIA') THEN m.cantidad ELSE 0 END)
-                 FROM movimientos m WHERE m.id_producto = ?), 0
-            ) as stock
-        ");
-        $stmt->execute([$producto_id]);
-        $result = $stmt->fetch();
-        return $result ? (int)$result['stock'] : 0;
-    } catch (PDOException $e) {
-        return 0;
-    }
-}
-
-function checkLowStock() {
-    try {
-        $pdo = getConnection();
-        $stmt = $pdo->query("
-            SELECT 
-                p.id, 
-                p.nombre, 
-                p.codigo, 
-                p.stock_minimo,
-                COALESCE(
-                    (SELECT SUM(CASE WHEN m.tipo_movimiento IN ('ENTRADA', 'AJUSTE') THEN m.cantidad ELSE 0 END) -
-                     SUM(CASE WHEN m.tipo_movimiento IN ('SALIDA', 'TRANSFERENCIA') THEN m.cantidad ELSE 0 END)
-                     FROM movimientos m WHERE m.id_producto = p.id), 0
-                ) as stock_actual
-            FROM productos p
-            WHERE p.activo = 1
-            HAVING stock_actual <= stock_minimo
-        ");
-        return $stmt->fetchAll();
-    } catch (PDOException $e) {
-        return [];
-    }
+    return getStockLotes($producto_id);
 }
 
 // ============================================================
 // FUNCIONES PEPS
 // ============================================================
 
-/**
- * Registrar entrada en lotes (PEPS)
- * IMPORTANTE: Recibe $pdo para usar la MISMA conexión/transacción
- */
 function registrarEntradaPEPS($pdo, $producto_id, $cantidad, $precio_unitario, $movimiento_id) {
     try {
         $stmt = $pdo->prepare("
@@ -154,26 +112,21 @@ function registrarEntradaPEPS($pdo, $producto_id, $cantidad, $precio_unitario, $
     }
 }
 
-/**
- * Consumir lotes para una salida (PEPS)
- * IMPORTANTE: Recibe $pdo para usar la MISMA conexión/transacción
- */
 function consumirLotesPEPS($pdo, $producto_id, $cantidad_salida, $movimiento_salida_id) {
     $cantidad_pendiente = $cantidad_salida;
     $costo_total = 0;
     $consumos = [];
     
-    // Obtener lotes disponibles ordenados por fecha (FIFO)
     $stmt = $pdo->prepare("
         SELECT id, cantidad_disponible, precio_unitario, fecha_ingreso
         FROM lotes 
         WHERE id_producto = ? AND cantidad_disponible > 0 AND activo = 1
         ORDER BY fecha_ingreso ASC, id ASC
+        FOR UPDATE
     ");
     $stmt->execute([$producto_id]);
     $lotes = $stmt->fetchAll();
     
-    // Verificar stock total
     $stock_total = array_sum(array_column($lotes, 'cantidad_disponible'));
     if ($stock_total < $cantidad_salida) {
         throw new Exception("Stock insuficiente. Stock actual: $stock_total, Solicitado: $cantidad_salida");
@@ -185,7 +138,6 @@ function consumirLotesPEPS($pdo, $producto_id, $cantidad_salida, $movimiento_sal
         $cantidad_consumir = min($cantidad_pendiente, $lote['cantidad_disponible']);
         $subtotal = $cantidad_consumir * $lote['precio_unitario'];
         
-        // Registrar consumo del lote
         $stmt = $pdo->prepare("
             INSERT INTO consumo_lotes 
             (id_movimiento_salida, id_lote, cantidad_consumida, precio_unitario, subtotal) 
@@ -199,7 +151,6 @@ function consumirLotesPEPS($pdo, $producto_id, $cantidad_salida, $movimiento_sal
             $subtotal
         ]);
         
-        // Actualizar cantidad disponible del lote
         $stmt = $pdo->prepare("
             UPDATE lotes 
             SET cantidad_disponible = cantidad_disponible - ? 
@@ -207,7 +158,6 @@ function consumirLotesPEPS($pdo, $producto_id, $cantidad_salida, $movimiento_sal
         ");
         $stmt->execute([$cantidad_consumir, $lote['id']]);
         
-        // Si el lote se agotó, desactivarlo
         $stmt = $pdo->prepare("
             UPDATE lotes 
             SET activo = 0 
@@ -233,9 +183,6 @@ function consumirLotesPEPS($pdo, $producto_id, $cantidad_salida, $movimiento_sal
     ];
 }
 
-/**
- * Obtener stock actual desde lotes (PEPS)
- */
 function getStockLotes($producto_id) {
     try {
         $pdo = getConnection();
@@ -252,9 +199,6 @@ function getStockLotes($producto_id) {
     }
 }
 
-/**
- * Obtener valor del inventario usando PEPS
- */
 function getValorInventarioPEPS() {
     try {
         $pdo = getConnection();
@@ -270,9 +214,6 @@ function getValorInventarioPEPS() {
     }
 }
 
-/**
- * Obtener detalle de lotes disponibles de un producto
- */
 function getLotesProducto($producto_id) {
     try {
         $pdo = getConnection();
@@ -293,9 +234,6 @@ function getLotesProducto($producto_id) {
     }
 }
 
-/**
- * Obtener ganancia total PEPS
- */
 function getGananciaTotalPEPS() {
     try {
         $pdo = getConnection();
@@ -311,9 +249,6 @@ function getGananciaTotalPEPS() {
     }
 }
 
-/**
- * Obtener total de ventas (ingresos)
- */
 function getTotalVentas() {
     try {
         $pdo = getConnection();
@@ -329,9 +264,6 @@ function getTotalVentas() {
     }
 }
 
-/**
- * Obtener costo total PEPS de ventas
- */
 function getCostoVentasPEPS() {
     try {
         $pdo = getConnection();
@@ -347,9 +279,21 @@ function getCostoVentasPEPS() {
     }
 }
 
-/**
- * Obtener productos con stock bajo (usando lotes)
- */
+function getCostoConsumo() {
+    try {
+        $pdo = getConnection();
+        $stmt = $pdo->query("
+            SELECT COALESCE(SUM(COALESCE(costo_peps, total)), 0) as total
+            FROM movimientos 
+            WHERE tipo_movimiento = 'CONSUMO'
+        ");
+        $result = $stmt->fetch();
+        return (float)($result['total'] ?? 0);
+    } catch (PDOException $e) {
+        return 0;
+    }
+}
+
 function checkLowStockPEPS() {
     try {
         $pdo = getConnection();
@@ -372,11 +316,30 @@ function checkLowStockPEPS() {
     }
 }
 
-/**
- * Obtener stock actual de un producto (PEPS)
- */
 function getStockActual($producto_id) {
     return getStockLotes($producto_id);
+}
+
+function conteoFueAjustado($pdo, $conteo) {
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) as total
+            FROM movimientos
+            WHERE id_producto = ?
+              AND (
+                  comentario LIKE ?
+                  OR comentario LIKE ?
+              )
+        ");
+        $stmt->execute([
+            (int)$conteo['id_producto'],
+            '%Ajuste manual por inventario físico ID: ' . (int)$conteo['id'] . '%',
+            '%conteo: ' . (int)$conteo['cantidad_contada'] . ', sistema: ' . (int)$conteo['cantidad_sistema'] . '%'
+        ]);
+        return (int)$stmt->fetch()['total'] > 0;
+    } catch (PDOException $e) {
+        return false;
+    }
 }
 
 // ============================================================
@@ -433,11 +396,22 @@ function getTotalConteos() {
 }
 
 // ============================================================
-// FUNCIONES AUXILIARES
+// FUNCIONES AUXILIARES  ← ¡AQUÍ ESTÁ LA CLAVE!
 // ============================================================
 
+/**
+ * Formatear moneda en Soles
+ */
+function moneda($amount, $decimales = 2) {
+    return 'S/ ' . number_format($amount, $decimales);
+}
+
+function formatSoles($amount, $decimales = 2) {
+    return 'S/ ' . number_format($amount, $decimales);
+}
+
 function formatMoney($amount) {
-    return '$' . number_format($amount, 2);
+    return 'S/ ' . number_format($amount, 2);
 }
 
 function formatDate($date, $format = 'd/m/Y') {

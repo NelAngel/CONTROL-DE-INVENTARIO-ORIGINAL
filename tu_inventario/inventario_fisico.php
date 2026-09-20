@@ -17,21 +17,33 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
         $message = '❌ No tienes permiso para realizar inventario físico';
     } else {
         try {
+            $pdo->beginTransaction();
+            
             // Validar campos obligatorios
-            if (empty($_POST['id_producto']) || empty($_POST['cantidad_contada']) || empty($_POST['fecha_conteo'])) {
+            if (empty($_POST['id_producto']) || !isset($_POST['cantidad_contada']) || empty($_POST['fecha_conteo'])) {
                 throw new Exception('Todos los campos son obligatorios');
             }
             
-            // Obtener stock actual del sistema
-            $stock_sistema = getStock($_POST['id_producto']);
-            $diferencia = $_POST['cantidad_contada'] - $stock_sistema;
+            $producto_id = (int)$_POST['id_producto'];
+            $cantidad_contada = (int)$_POST['cantidad_contada'];
             
+            // Obtener stock actual del sistema (desde LOTES PEPS)
+            $stock_sistema = getStockLotes($producto_id);
+            $diferencia = $cantidad_contada - $stock_sistema;
+            
+            // Obtener datos del producto
+            $stmt = $pdo->prepare("SELECT precio_compra FROM productos WHERE id = ?");
+            $stmt->execute([$producto_id]);
+            $producto = $stmt->fetch();
+            $precio_compra = $producto['precio_compra'] ?? 0;
+            
+            // Registrar el conteo
             $stmt = $pdo->prepare("INSERT INTO inventario_fisico 
                                    (id_producto, cantidad_contada, cantidad_sistema, diferencia, fecha_conteo, id_usuario_responsable, comentario) 
                                    VALUES (?, ?, ?, ?, ?, ?, ?)");
             $stmt->execute([
-                $_POST['id_producto'],
-                $_POST['cantidad_contada'],
+                $producto_id,
+                $cantidad_contada,
                 $stock_sistema,
                 $diferencia,
                 $_POST['fecha_conteo'],
@@ -39,41 +51,87 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
                 $_POST['comentario'] ?? ''
             ]);
             
-            $id = $pdo->lastInsertId();
+            $id_conteo = $pdo->lastInsertId();
             
             // Registrar en auditoría
-            logAudit('CREATE', 'inventario_fisico', $id, null, [
-                'producto' => $_POST['id_producto'],
-                'contado' => $_POST['cantidad_contada'],
+            logAudit('CREATE', 'inventario_fisico', $id_conteo, null, [
+                'producto' => $producto_id,
+                'contado' => $cantidad_contada,
                 'sistema' => $stock_sistema,
                 'diferencia' => $diferencia
             ]);
             
-            // Si hay diferencia y se quiere ajustar automáticamente
+            // ============ AJUSTAR STOCK SI HAY DIFERENCIA ============
             if ($diferencia != 0 && isset($_POST['ajustar_stock']) && $_POST['ajustar_stock'] == '1') {
-                // Crear un movimiento de ajuste automático
-                $tipo_ajuste = $diferencia > 0 ? 'ENTRADA' : 'SALIDA';
                 $cantidad_ajuste = abs($diferencia);
                 
-                $stmt = $pdo->prepare("INSERT INTO movimientos 
-                                       (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
-                                       VALUES (?, ?, ?, 0, 0, ?, ?)");
-                $stmt->execute([
-                    $_POST['id_producto'],
-                    $tipo_ajuste,
-                    $cantidad_ajuste,
-                    $_SESSION['user_id'],
-                    "Ajuste automático por inventario físico (conteo: {$_POST['cantidad_contada']}, sistema: $stock_sistema)"
-                ]);
+                if ($diferencia > 0) {
+                    // ============ SOBRANTE: Crear ENTRADA y LOTE ============
+                    $tipo_ajuste = 'ENTRADA';
+                    
+                    // 1. Registrar movimiento
+                    $stmt = $pdo->prepare("INSERT INTO movimientos 
+                                           (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
+                                           VALUES (?, ?, ?, ?, ?, ?, ?)");
+                    $stmt->execute([
+                        $producto_id,
+                        $tipo_ajuste,
+                        $cantidad_ajuste,
+                        $precio_compra,
+                        $cantidad_ajuste * $precio_compra,
+                        $_SESSION['user_id'],
+                        "Ajuste automático por inventario físico (id conteo: $id_conteo, conteo: $cantidad_contada, sistema: $stock_sistema)"
+                    ]);
+                    $movimiento_id = $pdo->lastInsertId();
+                    
+                    // 2. ✅ CREAR EL LOTE PEPS
+                    registrarEntradaPEPS($pdo, $producto_id, $cantidad_ajuste, $precio_compra, $movimiento_id);
+                    
+                } else {
+                    // ============ FALTANTE: Consumir LOTES ============
+                    $tipo_ajuste = 'SALIDA';
+                    
+                    // 1. Registrar movimiento
+                    $stmt = $pdo->prepare("INSERT INTO movimientos 
+                                           (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
+                                           VALUES (?, ?, ?, ?, ?, ?, ?)");
+                    $stmt->execute([
+                        $producto_id,
+                        $tipo_ajuste,
+                        $cantidad_ajuste,
+                        $precio_compra,
+                        $cantidad_ajuste * $precio_compra,
+                        $_SESSION['user_id'],
+                        "Ajuste automático por inventario físico (id conteo: $id_conteo, conteo: $cantidad_contada, sistema: $stock_sistema)"
+                    ]);
+                    $movimiento_id = $pdo->lastInsertId();
+                    
+                    // 2. ✅ CONSUMIR LOTES PEPS
+                    $resultado = consumirLotesPEPS($pdo, $producto_id, $cantidad_ajuste, $movimiento_id);
+                    
+                    // 3. Actualizar el movimiento con el costo PEPS real (el total y el precio reflejan ese costo)
+                    $precio_unitario_peps = $cantidad_ajuste > 0 ? $resultado['costo_total'] / $cantidad_ajuste : 0;
+                    $stmt = $pdo->prepare("UPDATE movimientos SET costo_peps = ?, total = ?, precio_unitario = ?, ganancia = 0 WHERE id = ?");
+                    $stmt->execute([
+                        $resultado['costo_total'],
+                        $resultado['costo_total'],
+                        $precio_unitario_peps,
+                        $movimiento_id
+                    ]);
+                }
                 
-                $message = '✅ Conteo registrado y stock ajustado automáticamente';
+                $message = '✅ Conteo registrado y stock ajustado automáticamente (lotes PEPS actualizados)';
             } else {
                 $message = '✅ Conteo registrado exitosamente. Diferencia: ' . ($diferencia > 0 ? '+' : '') . $diferencia . ' unidades';
             }
             
+            $pdo->commit();
+            
         } catch (PDOException $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
             $message = '❌ Error: ' . $e->getMessage();
         } catch (Exception $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
             $message = '❌ ' . $e->getMessage();
         }
     }
@@ -85,7 +143,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
         $message = '❌ No tienes permiso para ajustar stock';
     } else {
         try {
-            $id = $_POST['id'];
+            $pdo->beginTransaction();
+            
+            $id = (int)$_POST['id'];
             
             // Obtener datos del conteo
             $stmt = $pdo->prepare("SELECT * FROM inventario_fisico WHERE id = ?");
@@ -96,28 +156,78 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
                 throw new Exception('Conteo no encontrado');
             }
             
-            // Crear movimiento de ajuste
+            // Evitar el doble ajuste de un mismo conteo
+            if (conteoFueAjustado($pdo, $conteo)) {
+                throw new Exception('Este conteo ya fue ajustado anteriormente');
+            }
+            
+            $producto_id = $conteo['id_producto'];
             $diferencia = $conteo['diferencia'];
-            $tipo_ajuste = $diferencia > 0 ? 'ENTRADA' : 'SALIDA';
             $cantidad_ajuste = abs($diferencia);
             
-            $stmt = $pdo->prepare("INSERT INTO movimientos 
-                                   (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
-                                   VALUES (?, ?, ?, 0, 0, ?, ?)");
-            $stmt->execute([
-                $conteo['id_producto'],
-                $tipo_ajuste,
-                $cantidad_ajuste,
-                $_SESSION['user_id'],
-                "Ajuste manual por inventario físico ID: $id"
-            ]);
+            // Obtener precio del producto
+            $stmt = $pdo->prepare("SELECT precio_compra FROM productos WHERE id = ?");
+            $stmt->execute([$producto_id]);
+            $producto = $stmt->fetch();
+            $precio_compra = $producto['precio_compra'] ?? 0;
+            
+            if ($diferencia > 0) {
+                // ============ SOBRANTE: Crear ENTRADA y LOTE ============
+                $stmt = $pdo->prepare("INSERT INTO movimientos 
+                                       (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
+                                       VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?)");
+                $stmt->execute([
+                    $producto_id,
+                    $cantidad_ajuste,
+                    $precio_compra,
+                    $cantidad_ajuste * $precio_compra,
+                    $_SESSION['user_id'],
+                    "Ajuste manual por inventario físico ID: $id"
+                ]);
+                $movimiento_id = $pdo->lastInsertId();
+                
+                // ✅ CREAR LOTE
+                registrarEntradaPEPS($pdo, $producto_id, $cantidad_ajuste, $precio_compra, $movimiento_id);
+                
+            } else {
+                // ============ FALTANTE: Consumir LOTES ============
+                $stmt = $pdo->prepare("INSERT INTO movimientos 
+                                       (id_producto, tipo_movimiento, cantidad, precio_unitario, total, id_usuario, comentario) 
+                                       VALUES (?, 'SALIDA', ?, ?, ?, ?, ?)");
+                $stmt->execute([
+                    $producto_id,
+                    $cantidad_ajuste,
+                    $precio_compra,
+                    $cantidad_ajuste * $precio_compra,
+                    $_SESSION['user_id'],
+                    "Ajuste manual por inventario físico ID: $id"
+                ]);
+                $movimiento_id = $pdo->lastInsertId();
+                
+                // ✅ CONSUMIR LOTES
+                $resultado = consumirLotesPEPS($pdo, $producto_id, $cantidad_ajuste, $movimiento_id);
+                
+                // Actualizar con el costo PEPS real (el total y el precio reflejan ese costo)
+                $precio_unitario_peps = $cantidad_ajuste > 0 ? $resultado['costo_total'] / $cantidad_ajuste : 0;
+                $stmt = $pdo->prepare("UPDATE movimientos SET costo_peps = ?, total = ?, precio_unitario = ?, ganancia = 0 WHERE id = ?");
+                $stmt->execute([
+                    $resultado['costo_total'],
+                    $resultado['costo_total'],
+                    $precio_unitario_peps,
+                    $movimiento_id
+                ]);
+            }
             
             logAudit('UPDATE', 'inventario_fisico', $id);
-            $message = '✅ Stock ajustado exitosamente';
+            
+            $pdo->commit();
+            $message = '✅ Stock ajustado exitosamente (lotes PEPS actualizados)';
             
         } catch (PDOException $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
             $message = '❌ Error: ' . $e->getMessage();
         } catch (Exception $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
             $message = '❌ ' . $e->getMessage();
         }
     }
@@ -169,16 +279,10 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap5.min.css">
     <style>
-        /* ===== ESTILOS GLOBALES ===== */
         * { font-family: 'Inter', sans-serif; }
         body { background: #f0f2f5; }
         
-        /* ===== SIDEBAR ===== */
-        .sidebar {
-            min-height: 100vh;
-            background: #1a2035;
-            color: white;
-        }
+        .sidebar { min-height: 100vh; background: #1a2035; color: white; }
         .sidebar a {
             color: rgba(255,255,255,0.7);
             text-decoration: none;
@@ -188,33 +292,17 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
             margin: 4px 0;
             transition: all 0.3s;
         }
-        .sidebar a:hover {
-            background: rgba(255,255,255,0.1);
-            color: white;
-        }
-        .sidebar a.active {
-            background: #2d3748;
-            color: white;
-            border-left: 3px solid #4f46e5;
-        }
+        .sidebar a:hover { background: rgba(255,255,255,0.1); color: white; }
+        .sidebar a.active { background: #2d3748; color: white; border-left: 3px solid #4f46e5; }
         .sidebar a i { margin-right: 10px; width: 20px; }
-        .sidebar .user-info {
-            padding: 20px;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-        }
+        .sidebar .user-info { padding: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); }
         .sidebar .user-info h5 { color: white; margin-bottom: 2px; }
         .sidebar .user-info small { color: rgba(255,255,255,0.5); }
         
-        /* Badges de sidebar */
         .badge-sidebar {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 20px;
-            font-size: 0.7rem;
-            font-weight: 600;
-            background: rgba(255,255,255,0.15);
-            color: white;
-            float: right;
+            display: inline-block; padding: 2px 10px; border-radius: 20px;
+            font-size: 0.7rem; font-weight: 600;
+            background: rgba(255,255,255,0.15); color: white; float: right;
         }
         .badge-sidebar.blue { background: rgba(59, 130, 246, 0.3); color: #60a5fa; }
         .badge-sidebar.green { background: rgba(34, 197, 94, 0.3); color: #4ade80; }
@@ -223,140 +311,81 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
         .badge-sidebar.orange { background: rgba(245, 158, 11, 0.3); color: #fbbf24; }
         .badge-sidebar.cyan { background: rgba(6, 182, 212, 0.3); color: #67e8f9; }
         
-        /* ===== CONTENIDO ===== */
         .content-area { padding: 25px 30px; }
         .page-title { font-weight: 700; font-size: 1.8rem; color: #1a2035; }
         .page-subtitle { color: #6b7280; font-size: 0.95rem; }
         
-        /* ===== TARJETAS DE ESTADÍSTICAS ===== */
         .stat-card {
-            background: white;
-            border-radius: 16px;
-            padding: 18px 22px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            border: 1px solid #e5e7eb;
-            transition: all 0.3s;
-            height: 100%;
+            background: white; border-radius: 16px; padding: 18px 22px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb;
+            transition: all 0.3s; height: 100%;
         }
-        .stat-card:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 12px 40px rgba(0,0,0,0.08);
-        }
+        .stat-card:hover { transform: translateY(-4px); box-shadow: 0 12px 40px rgba(0,0,0,0.08); }
         .stat-card .stat-icon {
-            width: 44px;
-            height: 44px;
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.3rem;
-            margin-bottom: 10px;
+            width: 44px; height: 44px; border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.3rem; margin-bottom: 10px;
         }
         .stat-card .stat-icon.blue { background: #e0f2fe; color: #0284c7; }
         .stat-card .stat-icon.green { background: #dcfce7; color: #16a34a; }
         .stat-card .stat-icon.red { background: #fee2e2; color: #dc2626; }
         .stat-card .stat-icon.orange { background: #fef3c7; color: #d97706; }
-        .stat-card .stat-icon.purple { background: #ede9fe; color: #7c3aed; }
-        .stat-card .stat-number {
-            font-size: 1.8rem;
-            font-weight: 800;
-            color: #1a2035;
-            line-height: 1.2;
-        }
-        .stat-card .stat-label {
-            color: #6b7280;
-            font-size: 0.85rem;
-            font-weight: 500;
-        }
+        .stat-card .stat-number { font-size: 1.8rem; font-weight: 800; color: #1a2035; line-height: 1.2; }
+        .stat-card .stat-label { color: #6b7280; font-size: 0.85rem; font-weight: 500; }
         .stat-card .stat-change {
-            font-size: 0.75rem;
-            font-weight: 600;
-            padding: 2px 10px;
-            border-radius: 20px;
-            display: inline-block;
+            font-size: 0.75rem; font-weight: 600;
+            padding: 2px 10px; border-radius: 20px; display: inline-block;
         }
         .stat-card .stat-change.up { background: #dcfce7; color: #16a34a; }
         .stat-card .stat-change.down { background: #fee2e2; color: #dc2626; }
         
-        /* ===== TARJETAS DE SECCIONES ===== */
         .section-card {
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            border: 1px solid #e5e7eb;
+            background: white; border-radius: 16px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb;
             overflow: hidden;
         }
         .section-card .card-header-custom {
-            padding: 14px 22px;
-            background: #fafbfc;
+            padding: 14px 22px; background: #fafbfc;
             border-bottom: 1px solid #e5e7eb;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            display: flex; justify-content: space-between; align-items: center;
         }
-        .section-card .card-header-custom h5 {
-            font-weight: 600;
-            margin: 0;
-            color: #1a2035;
-            font-size: 1rem;
-        }
+        .section-card .card-header-custom h5 { font-weight: 600; margin: 0; color: #1a2035; font-size: 1rem; }
         .section-card .card-header-custom h5 i { margin-right: 8px; }
         .section-card .card-body-custom { padding: 18px 22px; }
         
-        /* ===== TABLA ===== */
-        .table-modern {
-            font-size: 0.9rem;
-        }
+        .table-modern { font-size: 0.9rem; }
         .table-modern th {
-            font-weight: 600;
-            color: #6b7280;
+            font-weight: 600; color: #6b7280;
             border-bottom: 2px solid #e5e7eb;
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px;
         }
-        .table-modern td {
-            vertical-align: middle;
-            padding: 10px 12px;
-        }
+        .table-modern td { vertical-align: middle; padding: 10px 12px; }
         .table-modern tr:hover { background: #f9fafb; }
         
-        /* ===== BADGES ===== */
         .badge-modern {
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-weight: 500;
-            font-size: 0.75rem;
+            padding: 4px 12px; border-radius: 20px;
+            font-weight: 500; font-size: 0.75rem;
         }
         .badge-modern.diferencia-positiva { background: #dcfce7; color: #16a34a; }
         .badge-modern.diferencia-negativa { background: #fee2e2; color: #dc2626; }
         .badge-modern.diferencia-cero { background: #f3f4f6; color: #6b7280; }
         
-        /* ===== FORMULARIO ===== */
         .form-modern .form-control,
         .form-modern .form-select {
-            border-radius: 10px;
-            border: 1px solid #e5e7eb;
-            padding: 10px 14px;
-            font-size: 0.9rem;
-            transition: all 0.3s;
+            border-radius: 10px; border: 1px solid #e5e7eb;
+            padding: 10px 14px; font-size: 0.9rem; transition: all 0.3s;
         }
         .form-modern .form-control:focus,
         .form-modern .form-select:focus {
             border-color: #4f46e5;
             box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
         }
-        .form-modern .form-label {
-            font-weight: 600;
-            font-size: 0.8rem;
-            color: #4b5563;
-        }
+        .form-modern .form-label { font-weight: 600; font-size: 0.8rem; color: #4b5563; }
         .form-modern .form-check-input:checked {
             background-color: #4f46e5;
             border-color: #4f46e5;
         }
         
-        /* ===== RESPONSIVE ===== */
         @media (max-width: 768px) {
             .content-area { padding: 15px; }
             .stat-card .stat-number { font-size: 1.3rem; }
@@ -380,7 +409,8 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
                         <li><a href="movimientos.php"><i class="bi bi-arrows-exchange"></i> Movimientos <span class="badge-sidebar purple"><?= $movimientos_hoy ?></span></a></li>
                         <li><a href="categorias.php"><i class="bi bi-tags"></i> Categorías <span class="badge-sidebar green"><?= $total_categorias ?></span></a></li>
                         <li><a href="proveedores.php"><i class="bi bi-truck"></i> Proveedores <span class="badge-sidebar cyan"><?= $total_proveedores ?></span></a></li>
-<li><a href="inventario_fisico.php" class="active"><i class="bi bi-clipboard-check"></i> Inventario Físico</a></li>                        <li><a href="reportes.php"><i class="bi bi-file-earmark-text"></i> Reportes</a></li>
+                        <li><a href="inventario_fisico.php" class="active"><i class="bi bi-clipboard-check"></i> Inventario Físico</a></li>
+                        <li><a href="reportes.php"><i class="bi bi-file-earmark-text"></i> Reportes</a></li>
                         <?php if (hasPermission('ADMIN')): ?>
                         <li><a href="usuarios.php"><i class="bi bi-people"></i> Usuarios</a></li>
                         <li><a href="auditoria.php"><i class="bi bi-clock-history"></i> Auditoría</a></li>
@@ -589,10 +619,13 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
                                                 <td><?= htmlspecialchars($conteo['responsable_nombre'] ?? 'N/A') ?></td>
                                                 <td><?= htmlspecialchars($conteo['comentario'] ?: '-') ?></td>
                                                 <td>
-                                                    <?php if ($conteo['diferencia'] != 0 && hasPermission('ADMIN')): ?>
+                                                    <?php $ajustado = conteoFueAjustado($pdo, $conteo); ?>
+                                                    <?php if ($conteo['diferencia'] != 0 && !$ajustado && hasPermission('ADMIN')): ?>
                                                         <button class="btn btn-sm btn-outline-warning" onclick="ajustarStock(<?= $conteo['id'] ?>)">
                                                             <i class="bi bi-pencil-square"></i> Ajustar
                                                         </button>
+                                                    <?php elseif ($conteo['diferencia'] != 0 && $ajustado): ?>
+                                                        <span class="badge bg-success">✔ Ajustado</span>
                                                     <?php else: ?>
                                                         <span class="text-muted" style="font-size: 0.75rem;">Sin ajuste</span>
                                                     <?php endif; ?>
@@ -627,7 +660,7 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
             });
         });
 
-        // ===== CARGAR STOCK DEL SISTEMA =====
+        // ===== CARGAR STOCK DEL SISTEMA (DESDE LOTES) =====
         $('#id_producto').on('change', function() {
             const producto_id = $(this).val();
             if (producto_id) {
@@ -652,7 +685,7 @@ $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHER
 
         // ===== AJUSTAR STOCK =====
         function ajustarStock(id) {
-            if (confirm('¿Estás seguro de que deseas ajustar el stock para este conteo?\n\nSe creará un movimiento automático para igualar el stock.')) {
+            if (confirm('¿Estás seguro de que deseas ajustar el stock para este conteo?\n\nSe creará un movimiento automático y se actualizarán los lotes PEPS.')) {
                 $('<form method="POST">' +
                     '<input type="hidden" name="action" value="ajustar">' +
                     '<input type="hidden" name="id" value="' + id + '">' +

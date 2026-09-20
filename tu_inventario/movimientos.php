@@ -53,31 +53,34 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
                 $precio_unitario = $producto['precio_venta'];
                 $total = $cantidad * $precio_unitario;
                 
-                // Verificar stock ANTES
                 $stock_disponible = getStockLotes($producto_id);
                 if ($stock_disponible < $cantidad) {
                     throw new Exception("Stock insuficiente. Disponible: $stock_disponible, Solicitado: $cantidad");
                 }
                 
-                // Costo PEPS se calculará DESPUÉS de insertar el movimiento
                 $costo_peps = 0;
                 $ganancia = 0;
                 
-            } elseif ($tipo == 'AJUSTE') {
+            } elseif ($tipo == 'CONSUMO') {
+                // CONSUMO: Descuenta stock pero NO genera venta ni ganancia
                 $precio_unitario = $producto['precio_compra'];
                 $total = $cantidad * $precio_unitario;
+                
+                $stock_disponible = getStockLotes($producto_id);
+                if ($stock_disponible < $cantidad) {
+                    throw new Exception("Stock insuficiente. Disponible: $stock_disponible, Solicitado: $cantidad");
+                }
+                
                 $costo_peps = 0;
                 $ganancia = 0;
                 
             } else {
-                // TRANSFERENCIA
-                $precio_unitario = $producto['precio_compra'];
-                $total = $cantidad * $precio_unitario;
-                $costo_peps = 0;
-                $ganancia = 0;
+                // AJUSTE y TRANSFERENCIA no se registran por esta vía.
+                // Los ajustes de stock deben realizarse desde Inventario Físico.
+                throw new Exception("Tipo de movimiento no soportado");
             }
             
-            // ============ PASO 1: REGISTRAR MOVIMIENTO PRIMERO ============
+            // ============ PASO 1: REGISTRAR MOVIMIENTO ============
             $stmt = $pdo->prepare("
                 INSERT INTO movimientos 
                 (id_producto, tipo_movimiento, cantidad, precio_unitario, total, costo_peps, ganancia, id_usuario, comentario) 
@@ -98,18 +101,22 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
             
             // ============ PASO 2: REGISTRAR EN LOTES ============
             if ($tipo == 'ENTRADA') {
-                // Registrar nuevo lote
                 registrarEntradaPEPS($pdo, $producto_id, $cantidad, $precio_unitario, $movimiento_id);
                 
-            } elseif ($tipo == 'SALIDA') {
-                // Consumir lotes PEPS (AHORA SÍ existe el movimiento_id)
+            } elseif ($tipo == 'SALIDA' || $tipo == 'CONSUMO') {
                 $resultado = consumirLotesPEPS($pdo, $producto_id, $cantidad, $movimiento_id);
                 $costo_peps = $resultado['costo_total'];
-                $ganancia = $total - $costo_peps;
                 
-                // Actualizar el movimiento con el costo PEPS y ganancia reales
-                $stmt = $pdo->prepare("UPDATE movimientos SET costo_peps = ?, ganancia = ? WHERE id = ?");
-                $stmt->execute([$costo_peps, $ganancia, $movimiento_id]);
+                if ($tipo == 'SALIDA') {
+                    $ganancia = $total - $costo_peps;
+                    $stmt = $pdo->prepare("UPDATE movimientos SET costo_peps = ?, ganancia = ? WHERE id = ?");
+                    $stmt->execute([$costo_peps, $ganancia, $movimiento_id]);
+                } else {
+                    // CONSUMO: el total y el precio unitario reflejan el costo PEPS real de los lotes consumidos
+                    $precio_unitario = $cantidad > 0 ? $costo_peps / $cantidad : 0;
+                    $stmt = $pdo->prepare("UPDATE movimientos SET costo_peps = ?, ganancia = 0, total = ?, precio_unitario = ? WHERE id = ?");
+                    $stmt->execute([$costo_peps, $costo_peps, $precio_unitario, $movimiento_id]);
+                }
             }
             
             logAudit('CREATE', 'movimientos', $movimiento_id, null, $_POST);
@@ -117,7 +124,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
             $pdo->commit();
             
             if ($tipo == 'SALIDA') {
-                $message = "✅ Salida registrada. Costo PEPS: $" . number_format($costo_peps, 2) . " | Ganancia: $" . number_format($ganancia, 2);
+                $message = "✅ Salida registrada. Costo PEPS: " . moneda($costo_peps) . " | Ganancia: " . moneda($ganancia);
+            } elseif ($tipo == 'CONSUMO') {
+                $message = "✅ Consumo registrado. Costo: " . moneda($costo_peps) . " (uso interno)";
             } else {
                 $message = '✅ Movimiento registrado exitosamente';
             }
@@ -170,6 +179,9 @@ $total_entradas = array_sum(array_column(array_filter($movimientos, function($m)
 $total_salidas = array_sum(array_column(array_filter($movimientos, function($m) {
     return $m['tipo_movimiento'] == 'SALIDA';
 }), 'cantidad'));
+$total_consumos = array_sum(array_column(array_filter($movimientos, function($m) {
+    return $m['tipo_movimiento'] == 'CONSUMO';
+}), 'cantidad'));
 $total_movimientos_hoy = getMovimientosHoy();
 
 // ============ VARIABLES PARA EL SIDEBAR ============
@@ -194,7 +206,6 @@ $total_usuarios = getTotalUsuarios();
         * { font-family: 'Inter', sans-serif; }
         body { background: #f0f2f5; }
         
-        /* ===== SIDEBAR ===== */
         .sidebar { min-height: 100vh; background: #1a2035; color: white; }
         .sidebar a {
             color: rgba(255,255,255,0.7);
@@ -224,12 +235,10 @@ $total_usuarios = getTotalUsuarios();
         .badge-sidebar.orange { background: rgba(245, 158, 11, 0.3); color: #fbbf24; }
         .badge-sidebar.cyan { background: rgba(6, 182, 212, 0.3); color: #67e8f9; }
         
-        /* ===== CONTENIDO ===== */
         .content-area { padding: 25px 30px; }
         .page-title { font-weight: 700; font-size: 1.8rem; color: #1a2035; }
         .page-subtitle { color: #6b7280; font-size: 0.95rem; }
         
-        /* ===== TARJETAS DE ESTADÍSTICAS ===== */
         .stat-card {
             background: white; border-radius: 16px; padding: 18px 22px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb;
@@ -245,6 +254,7 @@ $total_usuarios = getTotalUsuarios();
         .stat-card .stat-icon.green { background: #dcfce7; color: #16a34a; }
         .stat-card .stat-icon.red { background: #fee2e2; color: #dc2626; }
         .stat-card .stat-icon.purple { background: #ede9fe; color: #7c3aed; }
+        .stat-card .stat-icon.orange { background: #fef3c7; color: #d97706; }
         .stat-card .stat-number { font-size: 1.8rem; font-weight: 800; color: #1a2035; line-height: 1.2; }
         .stat-card .stat-label { color: #6b7280; font-size: 0.85rem; font-weight: 500; }
         .stat-card .stat-change {
@@ -253,8 +263,8 @@ $total_usuarios = getTotalUsuarios();
         }
         .stat-card .stat-change.up { background: #dcfce7; color: #16a34a; }
         .stat-card .stat-change.down { background: #fee2e2; color: #dc2626; }
+        .stat-card .stat-change.consumo { background: #fef3c7; color: #d97706; }
         
-        /* ===== TARJETAS DE SECCIONES ===== */
         .section-card {
             background: white; border-radius: 16px;
             box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb;
@@ -269,7 +279,6 @@ $total_usuarios = getTotalUsuarios();
         .section-card .card-header-custom h5 i { margin-right: 8px; }
         .section-card .card-body-custom { padding: 18px 22px; }
         
-        /* ===== TABLA ===== */
         .table-modern { font-size: 0.9rem; }
         .table-modern th {
             font-weight: 600; color: #6b7280;
@@ -279,7 +288,6 @@ $total_usuarios = getTotalUsuarios();
         .table-modern td { vertical-align: middle; padding: 10px 12px; }
         .table-modern tr:hover { background: #f9fafb; }
         
-        /* ===== BADGES ===== */
         .badge-modern {
             padding: 4px 12px; border-radius: 20px;
             font-weight: 500; font-size: 0.75rem;
@@ -288,8 +296,8 @@ $total_usuarios = getTotalUsuarios();
         .badge-modern.salida { background: #fee2e2; color: #dc2626; }
         .badge-modern.ajuste { background: #fef3c7; color: #d97706; }
         .badge-modern.transferencia { background: #e0f2fe; color: #0284c7; }
+        .badge-modern.consumo { background: #fef3c7; color: #d97706; }
         
-        /* ===== FORMULARIO ===== */
         .form-modern .form-control,
         .form-modern .form-select {
             border-radius: 10px; border: 1px solid #e5e7eb;
@@ -302,21 +310,24 @@ $total_usuarios = getTotalUsuarios();
         }
         .form-modern .form-label { font-weight: 600; font-size: 0.8rem; color: #4b5563; }
         
-        /* ===== INFO PRECIO ===== */
         .precio-info {
             background: #f0f9ff; border: 1px solid #bae6fd;
             border-radius: 10px; padding: 10px 14px; font-size: 0.85rem;
         }
         .precio-info .precio-valor { font-weight: 700; color: #0284c7; }
         
-        /* ===== ALERTA PEPS ===== */
         .alert-peps {
             background: #eff6ff; border: 1px solid #bfdbfe;
             border-radius: 10px; padding: 12px 16px; font-size: 0.85rem;
             color: #1e40af; margin-bottom: 20px;
         }
         
-        /* ===== RESPONSIVE ===== */
+        .alert-consumo {
+            background: #fef3c7; border: 1px solid #fde68a;
+            border-radius: 10px; padding: 12px 16px; font-size: 0.85rem;
+            color: #92400e; margin-bottom: 20px;
+        }
+        
         @media (max-width: 768px) {
             .content-area { padding: 15px; }
             .stat-card .stat-number { font-size: 1.3rem; }
@@ -381,7 +392,12 @@ $total_usuarios = getTotalUsuarios();
                     <div class="alert-peps">
                         <i class="bi bi-info-circle"></i>
                         <strong>Sistema PEPS:</strong> Cada compra crea un lote con su precio. 
-                        Al vender, se consume el lote más antiguo primero, dándote la <strong>mayor ganancia posible</strong>.
+                        Al vender, se consume el lote más antiguo primero.
+                        <br>
+                        <strong>🔧 CONSUMO:</strong> Usa esta opción para materiales de uso interno 
+                        (tornillos, cables, etc.) que NO se venden.
+                        <br>
+                        <strong>✏️ AJUSTES:</strong> Los ajustes de stock se realizan desde <a href="inventario_fisico.php">Inventario Físico</a>.
                     </div>
 
                     <!-- ===== TARJETAS DE ESTADÍSTICAS ===== -->
@@ -418,11 +434,11 @@ $total_usuarios = getTotalUsuarios();
                         </div>
                         <div class="col-xl-3 col-lg-6 col-md-6">
                             <div class="stat-card">
-                                <div class="stat-icon purple"><i class="bi bi-boxes"></i></div>
-                                <div class="stat-number"><?= number_format(count($productos)) ?></div>
-                                <div class="stat-label">Productos Activos</div>
+                                <div class="stat-icon orange"><i class="bi bi-tools"></i></div>
+                                <div class="stat-number text-warning"><?= number_format($total_consumos) ?></div>
+                                <div class="stat-label">Unidades en Consumo</div>
                                 <div class="mt-2">
-                                    <span class="stat-change up"><i class="bi bi-box"></i> En inventario</span>
+                                    <span class="stat-change consumo"><i class="bi bi-wrench"></i> Uso interno</span>
                                 </div>
                             </div>
                         </div>
@@ -443,7 +459,7 @@ $total_usuarios = getTotalUsuarios();
                                         <select name="tipo_movimiento" id="tipo_movimiento" class="form-select" required>
                                             <option value="ENTRADA" <?= isset($_GET['action']) && $_GET['action'] == 'entrada' ? 'selected' : '' ?>>📥 Entrada (Compra)</option>
                                             <option value="SALIDA" <?= isset($_GET['action']) && $_GET['action'] == 'salida' ? 'selected' : '' ?>>📤 Salida (Venta)</option>
-                                            <option value="AJUSTE">✏️ Ajuste</option>
+                                            <option value="CONSUMO" <?= isset($_GET['action']) && $_GET['action'] == 'consumo' ? 'selected' : '' ?>>🔧 Consumo (Uso interno)</option>
                                         </select>
                                     </div>
                                     <div class="col-md-4">
@@ -479,7 +495,7 @@ $total_usuarios = getTotalUsuarios();
                                         <div class="precio-info" id="precioInfo" style="display: none;">
                                             <i class="bi bi-info-circle"></i>
                                             <strong id="precioInfoLabel">Precio:</strong> 
-                                            <span class="precio-valor" id="precioInfoValor">$0.00</span>
+                                            <span class="precio-valor" id="precioInfoValor">S/ 0.00</span>
                                             <span class="text-muted ms-2" id="precioInfoText"></span>
                                         </div>
                                     </div>
@@ -557,15 +573,17 @@ $total_usuarios = getTotalUsuarios();
                                                             <i class="bi bi-arrow-up"></i>
                                                         <?php elseif ($mov['tipo_movimiento'] == 'SALIDA'): ?>
                                                             <i class="bi bi-arrow-down"></i>
+                                                        <?php elseif ($mov['tipo_movimiento'] == 'CONSUMO'): ?>
+                                                            <i class="bi bi-tools"></i>
                                                         <?php endif; ?>
                                                     </span>
                                                 </td>
                                                 <td class="text-center"><strong><?= $mov['cantidad'] ?></strong></td>
-                                                <td>S/<?= number_format($mov['precio_unitario'], 2) ?></td>
-                                                <td>S/<?= number_format($mov['total'], 2) ?></td>
+                                                <td><?= moneda($mov['precio_unitario']) ?></td>
+                                                <td><?= moneda($mov['total']) ?></td>
                                                 <td>
-                                                    <?php if ($mov['tipo_movimiento'] == 'SALIDA'): ?>
-                                                        <span class="text-warning fw-bold">S/<?= number_format($mov['costo_peps'], 2) ?></span>
+                                                    <?php if ($mov['tipo_movimiento'] == 'SALIDA' || $mov['tipo_movimiento'] == 'CONSUMO'): ?>
+                                                        <span class="text-warning fw-bold"><?= moneda($mov['costo_peps']) ?></span>
                                                     <?php else: ?>
                                                         <span class="text-muted">-</span>
                                                     <?php endif; ?>
@@ -573,8 +591,10 @@ $total_usuarios = getTotalUsuarios();
                                                 <td>
                                                     <?php if ($mov['tipo_movimiento'] == 'SALIDA'): ?>
                                                         <span class="<?= $mov['ganancia'] >= 0 ? 'text-success' : 'text-danger' ?> fw-bold">
-                                                            S/<?= number_format($mov['ganancia'], 2) ?>
+                                                            <?= moneda($mov['ganancia']) ?>
                                                         </span>
+                                                    <?php elseif ($mov['tipo_movimiento'] == 'CONSUMO'): ?>
+                                                        <span class="badge bg-warning text-dark" style="font-size: 0.7rem;">Uso interno</span>
                                                     <?php else: ?>
                                                         <span class="text-muted">-</span>
                                                     <?php endif; ?>
@@ -640,8 +660,22 @@ $total_usuarios = getTotalUsuarios();
                 
                 if (selectedOption.value) {
                     document.getElementById('precioInfoLabel').textContent = 'Precio de venta:';
-                    document.getElementById('precioInfoValor').textContent = '$' + precioVenta.toFixed(2);
+                    document.getElementById('precioInfoValor').textContent = 'S/ ' + precioVenta.toFixed(2);
                     document.getElementById('precioInfoText').textContent = '(Stock disponible: ' + stock + ' unidades)';
+                    precioInfo.style.display = 'block';
+                } else {
+                    precioInfo.style.display = 'none';
+                }
+                
+            } else if (tipo === 'CONSUMO') {
+                precioField.style.display = 'none';
+                precioInput.required = false;
+                precioInput.value = '';
+                
+                if (selectedOption.value) {
+                    document.getElementById('precioInfoLabel').textContent = 'Costo de consumo:';
+                    document.getElementById('precioInfoValor').textContent = 'S/ ' + precioCompra.toFixed(2);
+                    document.getElementById('precioInfoText').textContent = '(Stock disponible: ' + stock + ' unidades - NO genera ganancia)';
                     precioInfo.style.display = 'block';
                 } else {
                     precioInfo.style.display = 'none';
@@ -653,8 +687,8 @@ $total_usuarios = getTotalUsuarios();
                 precioInput.value = '';
                 
                 if (selectedOption.value) {
-                    document.getElementById('precioInfoLabel').textContent = 'Costo de compra:';
-                    document.getElementById('precioInfoValor').textContent = '$' + precioCompra.toFixed(2);
+                    document.getElementById('precioInfoLabel').textContent = 'Costo:';
+                    document.getElementById('precioInfoValor').textContent = 'S/ ' + precioCompra.toFixed(2);
                     document.getElementById('precioInfoText').textContent = '(se usa el costo de compra)';
                     precioInfo.style.display = 'block';
                 } else {

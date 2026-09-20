@@ -101,15 +101,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['action']) && $_POST['a
     }
 }
 
-// ============ OBTENER DATOS ============
+// ============ OBTENER DATOS (CON CÁLCULO PEPS) ============
 $productos = $pdo->query("
     SELECT p.*, 
            c.nombre as categoria_nombre, 
            pr.nombre as proveedor_nombre,
            COALESCE(
-               (SELECT SUM(CASE WHEN m.tipo_movimiento IN ('ENTRADA', 'AJUSTE') THEN m.cantidad ELSE 0 END) -
-                SUM(CASE WHEN m.tipo_movimiento IN ('SALIDA', 'TRANSFERENCIA') THEN m.cantidad ELSE 0 END)
-                FROM movimientos m WHERE m.id_producto = p.id), 0
+               (SELECT SUM(l.cantidad_disponible) 
+                FROM lotes l 
+                WHERE l.id_producto = p.id AND l.activo = 1), 0
            ) as stock_actual
     FROM productos p
     LEFT JOIN categorias c ON p.id_categoria = c.id
@@ -127,6 +127,12 @@ $total_stock = array_sum(array_column($productos, 'stock_actual'));
 $productos_bajo = count(array_filter($productos, function($p) {
     return $p['stock_actual'] <= $p['stock_minimo'];
 }));
+
+// Variables para el sidebar
+$total_categorias = count($categorias);
+$total_proveedores = count($proveedores);
+$movimientos_hoy = getMovimientosHoy();
+$total_usuarios = getTotalUsuarios();
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -184,6 +190,7 @@ $productos_bajo = count(array_filter($productos, function($p) {
             font-weight: 600;
             background: rgba(255,255,255,0.15);
             color: white;
+            float: right;
         }
         .badge-sidebar.blue { background: rgba(59, 130, 246, 0.3); color: #60a5fa; }
         .badge-sidebar.green { background: rgba(34, 197, 94, 0.3); color: #4ade80; }
@@ -234,6 +241,8 @@ $productos_bajo = count(array_filter($productos, function($p) {
         .btn-action-info:hover { background: #0284c7; color: white; }
         .btn-action-secondary { background: #6b7280; color: white; }
         .btn-action-secondary:hover { background: #4b5563; color: white; }
+        .btn-action-cyan { background: #06b6d4; color: white; }
+        .btn-action-cyan:hover { background: #0891b2; color: white; }
         
         /* ===== TARJETAS DE ESTADÍSTICAS ===== */
         .stat-card {
@@ -365,14 +374,14 @@ $productos_bajo = count(array_filter($productos, function($p) {
                     </div>
                     <ul class="nav flex-column p-2">
                         <li><a href="index.php"><i class="bi bi-speedometer2"></i> Dashboard</a></li>
-                        <li><a href="productos.php" class="active"><i class="bi bi-box"></i> Productos <span class="badge-sidebar blue float-end"><?= $total_productos ?></span></a></li>
-                        <li><a href="movimientos.php"><i class="bi bi-arrows-exchange"></i> Movimientos</a></li>
-                        <li><a href="categorias.php"><i class="bi bi-tags"></i> Categorías</a></li>
-                        <li><a href="proveedores.php"><i class="bi bi-truck"></i> Proveedores</a></li>
+                        <li><a href="productos.php" class="active"><i class="bi bi-box"></i> Productos <span class="badge-sidebar blue"><?= $total_productos ?></span></a></li>
+                        <li><a href="movimientos.php"><i class="bi bi-arrows-exchange"></i> Movimientos <span class="badge-sidebar purple"><?= $movimientos_hoy ?></span></a></li>
+                        <li><a href="categorias.php"><i class="bi bi-tags"></i> Categorías <span class="badge-sidebar green"><?= $total_categorias ?></span></a></li>
+                        <li><a href="proveedores.php"><i class="bi bi-truck"></i> Proveedores <span class="badge-sidebar cyan"><?= $total_proveedores ?></span></a></li>
                         <li><a href="inventario_fisico.php"><i class="bi bi-clipboard-check"></i> Inventario Físico</a></li>
                         <li><a href="reportes.php"><i class="bi bi-file-earmark-text"></i> Reportes</a></li>
                         <?php if (hasPermission('ADMIN')): ?>
-                        <li><a href="usuarios.php"><i class="bi bi-people"></i> Usuarios</a></li>
+                        <li><a href="usuarios.php"><i class="bi bi-people"></i> Usuarios <span class="badge-sidebar blue"><?= $total_usuarios ?></span></a></li>
                         <li><a href="auditoria.php"><i class="bi bi-clock-history"></i> Auditoría</a></li>
                         <?php endif; ?>
                         <li><hr class="border-secondary"></li>
@@ -416,6 +425,9 @@ $productos_bajo = count(array_filter($productos, function($p) {
                             </a>
                             <a href="movimientos.php?action=salida" class="btn-action btn-action-danger">
                                 <i class="bi bi-arrow-up-circle"></i> Salida
+                            </a>
+                            <a href="movimientos.php?action=consumo" class="btn-action btn-action-warning">
+                                <i class="bi bi-tools"></i> Consumo
                             </a>
                         </div>
                     </div>
@@ -470,10 +482,10 @@ $productos_bajo = count(array_filter($productos, function($p) {
                         <div class="col-xl-3 col-lg-6 col-md-6">
                             <div class="stat-card">
                                 <div class="stat-icon purple"><i class="bi bi-tags"></i></div>
-                                <div class="stat-number"><?= number_format(count($categorias)) ?></div>
+                                <div class="stat-number"><?= number_format($total_categorias) ?></div>
                                 <div class="stat-label">Categorías</div>
                                 <div class="mt-2">
-                                    <span class="stat-change up"><i class="bi bi-truck"></i> <?= count($proveedores) ?> proveedores</span>
+                                    <span class="stat-change up"><i class="bi bi-truck"></i> <?= $total_proveedores ?> proveedores</span>
                                 </div>
                             </div>
                         </div>
@@ -528,8 +540,8 @@ $productos_bajo = count(array_filter($productos, function($p) {
                                                 <td><strong><?= htmlspecialchars($producto['nombre']) ?></strong></td>
                                                 <td><?= htmlspecialchars($producto['categoria_nombre'] ?? 'Sin categoría') ?></td>
                                                 <td><?= htmlspecialchars($producto['proveedor_nombre'] ?? 'Sin proveedor') ?></td>
-                                                <td>S/<?= number_format($producto['precio_compra'], 2) ?></td>
-                                                <td>S/<?= number_format($producto['precio_venta'], 2) ?></td>
+                                                <td><?= moneda($producto['precio_compra']) ?></td>
+                                                <td><?= moneda($producto['precio_venta']) ?></td>
                                                 <td>
                                                     <span class="badge-modern <?= $stock_class ?>">
                                                         <?= $producto['stock_actual'] ?>

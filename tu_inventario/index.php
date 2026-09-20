@@ -13,7 +13,7 @@ $pdo = getConnection();
 // Total de productos
 $total_productos = $pdo->query("SELECT COUNT(*) as total FROM productos WHERE activo = 1")->fetch()['total'];
 
-// Productos con stock bajo
+// Productos con stock bajo (INCLUYE CONSUMO)
 $productos_bajo_stock = $pdo->query("
     SELECT 
         p.id, 
@@ -21,11 +21,7 @@ $productos_bajo_stock = $pdo->query("
         p.codigo, 
         p.stock_minimo,
         p.precio_compra,
-        COALESCE(
-            (SELECT SUM(CASE WHEN m.tipo_movimiento = 'ENTRADA' OR m.tipo_movimiento = 'AJUSTE' THEN m.cantidad ELSE 0 END)
-             - SUM(CASE WHEN m.tipo_movimiento = 'SALIDA' OR m.tipo_movimiento = 'TRANSFERENCIA' THEN m.cantidad ELSE 0 END)
-             FROM movimientos m WHERE m.id_producto = p.id), 0
-        ) as stock_actual
+        COALESCE((SELECT SUM(l.cantidad_disponible) FROM lotes l WHERE l.id_producto = p.id AND l.activo = 1), 0) as stock_actual
     FROM productos p
     WHERE p.activo = 1
 ")->fetchAll();
@@ -48,28 +44,15 @@ $total_categorias = $pdo->query("SELECT COUNT(*) as total FROM categorias WHERE 
 // Total de proveedores
 $total_proveedores = $pdo->query("SELECT COUNT(*) as total FROM proveedores WHERE activo = 1")->fetch()['total'];
 
-// ============ VALOR TOTAL DEL INVENTARIO ============
+// ============ VALOR TOTAL DEL INVENTARIO (INCLUYE CONSUMO) ============
 $valor_inventario = $pdo->query("
-    SELECT COALESCE(SUM(
-        p.precio_compra * (
-            SELECT COALESCE(SUM(
-                CASE 
-                    WHEN m.tipo_movimiento = 'ENTRADA' THEN m.cantidad
-                    WHEN m.tipo_movimiento = 'AJUSTE' THEN m.cantidad
-                    WHEN m.tipo_movimiento = 'SALIDA' THEN -m.cantidad
-                    WHEN m.tipo_movimiento = 'TRANSFERENCIA' THEN -m.cantidad
-                    ELSE 0 
-                END
-            ), 0)
-            FROM movimientos m 
-            WHERE m.id_producto = p.id
-        )
-    ), 0) as total
-    FROM productos p
-    WHERE p.activo = 1
+    SELECT COALESCE(SUM(l.cantidad_disponible * l.precio_unitario), 0) as total
+    FROM lotes l
+    JOIN productos p ON l.id_producto = p.id
+    WHERE l.activo = 1 AND p.activo = 1
 ")->fetch()['total'];
 
-// ============ GANANCIAS (NUEVO) ============
+// ============ GANANCIAS (SOLO VENTAS) ============
 // Total de ventas (ingresos por salidas)
 $total_ventas = $pdo->query("
     SELECT COALESCE(SUM(total), 0) as total 
@@ -77,7 +60,6 @@ $total_ventas = $pdo->query("
     WHERE tipo_movimiento = 'SALIDA'
 ")->fetch()['total'];
 
-// Costo de los productos vendidos (precio de compra × cantidad vendida)
 // Costo de los productos vendidos (COSTO PEPS REAL)
 $costo_ventas = $pdo->query("
     SELECT COALESCE(SUM(costo_peps), 0) as total
@@ -87,6 +69,28 @@ $costo_ventas = $pdo->query("
 
 // Ganancia neta = Ventas - Costo de ventas
 $ganancia_neta = $total_ventas - $costo_ventas;
+
+// ============ CONSUMOS INTERNOS (NO AFECTA GANANCIA) ============
+// Costo total de consumos
+$costo_consumo = $pdo->query("
+    SELECT COALESCE(SUM(COALESCE(costo_peps, total)), 0) as total
+    FROM movimientos 
+    WHERE tipo_movimiento = 'CONSUMO'
+")->fetch()['total'];
+
+// Total de unidades consumidas
+$unidades_consumidas = $pdo->query("
+    SELECT COALESCE(SUM(cantidad), 0) as total
+    FROM movimientos 
+    WHERE tipo_movimiento = 'CONSUMO'
+")->fetch()['total'];
+
+// Total de movimientos de consumo
+$total_consumos = $pdo->query("
+    SELECT COUNT(*) as total
+    FROM movimientos 
+    WHERE tipo_movimiento = 'CONSUMO'
+")->fetch()['total'];
 
 // ============ ÚLTIMOS MOVIMIENTOS ============
 $movimientos_recientes = $pdo->query("
@@ -110,11 +114,7 @@ $productos_criticos = $pdo->query("
         p.stock_minimo,
         p.stock_maximo,
         p.precio_compra,
-        COALESCE(
-            (SELECT SUM(CASE WHEN m.tipo_movimiento = 'ENTRADA' OR m.tipo_movimiento = 'AJUSTE' THEN m.cantidad ELSE 0 END)
-             - SUM(CASE WHEN m.tipo_movimiento = 'SALIDA' OR m.tipo_movimiento = 'TRANSFERENCIA' THEN m.cantidad ELSE 0 END)
-             FROM movimientos m WHERE m.id_producto = p.id), 0
-        ) as stock_actual
+        COALESCE((SELECT SUM(l.cantidad_disponible) FROM lotes l WHERE l.id_producto = p.id AND l.activo = 1), 0) as stock_actual
     FROM productos p
     WHERE p.activo = 1
     HAVING stock_actual <= stock_minimo * 2
@@ -130,7 +130,7 @@ $top_productos = $pdo->query("
         p.codigo,
         SUM(m.cantidad) as total_vendido,
         SUM(m.total) as total_ingresos,
-        SUM(m.cantidad * p.precio_compra) as total_costo
+        SUM(m.costo_peps) as total_costo
     FROM movimientos m
     JOIN productos p ON m.id_producto = p.id
     WHERE m.tipo_movimiento = 'SALIDA'
@@ -145,8 +145,8 @@ $total_productos_sidebar = $total_productos;
 $movimientos_hoy_sidebar = $movimientos_hoy;
 $total_categorias_sidebar = $total_categorias;
 $total_proveedores_sidebar = $total_proveedores;
-$total_conteos = $pdo->query("SELECT COUNT(*) as total FROM inventario_fisico WHERE fecha_conteo >= DATE_SUB(NOW(), INTERVAL 30 DAY)")->fetch()['total'];
-$total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE activo = 1")->fetch()['total'];
+$total_conteos = getTotalConteos();
+$total_usuarios = getTotalUsuarios();
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -306,7 +306,7 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
         }
         .stat-card .stat-change.up { background: #dcfce7; color: #16a34a; }
         .stat-card .stat-change.down { background: #fee2e2; color: #dc2626; }
-        .stat-card .stat-change.ganancia { background: #dbeafe; color: #2563eb; }
+        .stat-card .stat-change.consumo { background: #fef3c7; color: #d97706; }
         
         /* ===== TARJETAS DE SECCIONES ===== */
         .section-card {
@@ -362,6 +362,7 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
         .badge-modern.salida { background: #fee2e2; color: #dc2626; }
         .badge-modern.ajuste { background: #fef3c7; color: #d97706; }
         .badge-modern.transferencia { background: #e0f2fe; color: #0284c7; }
+        .badge-modern.consumo { background: #fef3c7; color: #d97706; }
         .badge-modern.stock-bajo { background: #fee2e2; color: #dc2626; }
         .badge-modern.stock-critico { background: #fef3c7; color: #d97706; }
         .badge-modern.stock-normal { background: #dcfce7; color: #16a34a; }
@@ -377,6 +378,73 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
         .alert-stock.alert-danger { border-left-color: #ef4444; }
         .alert-stock .badge { font-size: 0.8rem; }
         
+        /* ===== TARJETAS DE RESUMEN (VENTAS Y CONSUMOS) ===== */
+        .summary-card {
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+            border: 1px solid #e5e7eb;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        .summary-card .summary-header {
+            padding: 16px 24px;
+            font-weight: 700;
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .summary-card .summary-header.ventas {
+            background: #22c55e;
+            color: white;
+        }
+        .summary-card .summary-header.consumos {
+            background: #f59e0b;
+            color: white;
+        }
+        .summary-card .summary-body {
+            padding: 24px;
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .summary-card .summary-stats {
+            display: flex;
+            width: 100%;
+            text-align: center;
+        }
+        .summary-card .summary-stat {
+            flex: 1;
+            padding: 0 8px;
+        }
+        .summary-card .summary-stat .label {
+            font-size: 0.75rem;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: block;
+            font-weight: 600;
+        }
+        .summary-card .summary-stat .value {
+            font-size: 1.5rem;
+            font-weight: 800;
+            line-height: 1.2;
+        }
+        .summary-card .summary-stat .value.verde { color: #16a34a; }
+        .summary-card .summary-stat .value.rojo { color: #dc2626; }
+        .summary-card .summary-stat .value.amarillo { color: #d97706; }
+        .summary-card .summary-footer {
+            padding: 8px 24px 12px;
+            text-align: center;
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+        
         /* ===== RESPONSIVE ===== */
         @media (max-width: 768px) {
             .content-area { padding: 15px; }
@@ -388,6 +456,7 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                 width: 100%;
                 justify-content: center;
             }
+            .summary-card .summary-stat .value { font-size: 1.2rem; }
         }
     </style>
 </head>
@@ -448,6 +517,9 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                             </a>
                             <a href="movimientos.php?action=salida" class="btn-action btn-action-danger">
                                 <i class="bi bi-arrow-up-circle"></i> Nueva Salida
+                            </a>
+                            <a href="movimientos.php?action=consumo" class="btn-action btn-action-warning">
+                                <i class="bi bi-tools"></i> Nuevo Consumo
                             </a>
                             <a href="inventario_fisico.php" class="btn-action btn-action-info">
                                 <i class="bi bi-clipboard-check"></i> Inventario Físico
@@ -526,7 +598,7 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                             </div>
                         </div>
                         
-                        <!-- Tarjeta 6: GANANCIA NETA (DESTACADA) -->
+                        <!-- Tarjeta 6: GANANCIA NETA -->
                         <div class="col-xl-2 col-lg-4 col-md-6">
                             <div class="stat-card" style="border: 2px solid <?= $ganancia_neta >= 0 ? '#22c55e' : '#ef4444' ?>;">
                                 <div class="stat-icon <?= $ganancia_neta >= 0 ? 'green' : 'red' ?>">
@@ -545,27 +617,62 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                         </div>
                     </div>
 
-                    <!-- ===== RESUMEN DE GANANCIAS (detalle) ===== -->
+                    <!-- ===== RESUMEN DE VENTAS Y CONSUMOS (MISMO DISEÑO) ===== -->
                     <div class="row g-3 mb-4">
-                        <div class="col-12">
-                            <div class="card bg-light">
-                                <div class="card-body py-3">
-                                    <div class="row text-center">
-                                        <div class="col-4">
-                                            <span class="text-muted">Total Ventas</span>
-                                            <h5 class="text-success mb-0">S/<?= number_format($total_ventas, 2) ?></h5>
+                        <!-- Cuadro de Ventas -->
+                        <div class="col-md-6">
+                            <div class="summary-card">
+                                <div class="summary-header ventas">
+                                    <i class="bi bi-cart-check"></i> Ventas
+                                </div>
+                                <div class="summary-body">
+                                    <div class="summary-stats">
+                                        <div class="summary-stat">
+                                            <span class="label">Total Ventas</span>
+                                            <div class="value verde">S/<?= number_format($total_ventas, 2) ?></div>
                                         </div>
-                                        <div class="col-4">
-                                            <span class="text-muted">Costo de Ventas</span>
-                                            <h5 class="text-danger mb-0">S/<?= number_format($costo_ventas, 2) ?></h5>
+                                        <div class="summary-stat">
+                                            <span class="label">Costo PEPS</span>
+                                            <div class="value rojo">S/<?= number_format($costo_ventas, 2) ?></div>
                                         </div>
-                                        <div class="col-4">
-                                            <span class="text-muted">💰 Ganancia Neta</span>
-                                            <h5 class="<?= $ganancia_neta >= 0 ? 'text-success' : 'text-danger' ?> mb-0">
+                                        <div class="summary-stat">
+                                            <span class="label">💰 Ganancia</span>
+                                            <div class="value <?= $ganancia_neta >= 0 ? 'verde' : 'rojo' ?>">
                                                 S/<?= number_format($ganancia_neta, 2) ?>
-                                            </h5>
+                                            </div>
                                         </div>
                                     </div>
+                                </div>
+                                <div class="summary-footer">
+                                    ✅ Afecta la ganancia neta del negocio
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Cuadro de Consumos Internos (MISMO DISEÑO) -->
+                        <div class="col-md-6">
+                            <div class="summary-card">
+                                <div class="summary-header consumos">
+                                    <i class="bi bi-tools"></i> Consumos Internos
+                                </div>
+                                <div class="summary-body">
+                                    <div class="summary-stats">
+                                        <div class="summary-stat">
+                                            <span class="label">Movimientos</span>
+                                            <div class="value amarillo"><?= number_format($total_consumos) ?></div>
+                                        </div>
+                                        <div class="summary-stat">
+                                            <span class="label">Unidades</span>
+                                            <div class="value amarillo"><?= number_format($unidades_consumidas) ?></div>
+                                        </div>
+                                        <div class="summary-stat">
+                                            <span class="label">Costo Total</span>
+                                            <div class="value amarillo">S/<?= number_format($costo_consumo, 2) ?></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="summary-footer">
+                                    🔧 Uso interno - NO afecta la ganancia
                                 </div>
                             </div>
                         </div>
@@ -657,6 +764,8 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                                                                         <i class="bi bi-arrow-up"></i>
                                                                     <?php elseif ($mov['tipo_movimiento'] == 'SALIDA'): ?>
                                                                         <i class="bi bi-arrow-down"></i>
+                                                                    <?php elseif ($mov['tipo_movimiento'] == 'CONSUMO'): ?>
+                                                                        <i class="bi bi-tools"></i>
                                                                     <?php endif; ?>
                                                                 </span>
                                                             </td>
@@ -730,7 +839,7 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
                                         </div>
                                     <?php else: ?>
                                         <?php foreach ($productos_criticos as $producto): 
-                                            $porcentaje = ($producto['stock_actual'] / $producto['stock_maximo']) * 100;
+                                            $porcentaje = $producto['stock_maximo'] > 0 ? ($producto['stock_actual'] / $producto['stock_maximo']) * 100 : 0;
                                             $color = $porcentaje <= 25 ? 'danger' : ($porcentaje <= 50 ? 'warning' : 'info');
                                         ?>
                                             <div class="d-flex align-items-center mb-3">
@@ -767,9 +876,8 @@ $total_usuarios = $pdo->query("SELECT COUNT(*) as total FROM usuarios WHERE acti
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Animación de entrada para las tarjetas
         document.addEventListener('DOMContentLoaded', function() {
-            const cards = document.querySelectorAll('.stat-card, .section-card');
+            const cards = document.querySelectorAll('.stat-card, .section-card, .summary-card');
             cards.forEach((card, index) => {
                 card.style.opacity = '0';
                 card.style.transform = 'translateY(20px)';
